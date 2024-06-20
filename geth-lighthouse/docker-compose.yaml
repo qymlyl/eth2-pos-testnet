@@ -1,0 +1,113 @@
+version: "3.8"
+networks:
+  network_eth:
+    driver: bridge
+    name: network_eth_l1
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+services:
+  geth:
+    networks:
+      network_eth:
+        ipv4_address: 172.20.0.2
+    image: ethereum/client-go:latest
+    command:
+      - --networkid=3151908
+      - --state.scheme=path
+      - --verbosity=3
+      - --datadir=/execution-data
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.vhosts=*
+      - --http.corsdomain=*
+      - --http.api=admin,engine,net,eth,web3,debug,txpool
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --ws.api=admin,engine,net,eth,web3,debug,txpool
+      - --ws.origins=*
+      - --allow-insecure-unlock
+      - --nat=extip:172.20.0.2
+      - --authrpc.port=8551
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.vhosts=*
+      - --authrpc.jwtsecret=/el-cl-genesis-data/jwt/jwtsecret
+      - --syncmode=full
+      - --rpc.allow-unprotected-txs
+      - --metrics
+      - --metrics.addr=0.0.0.0
+      - --metrics.port=9001
+      - --discovery.port=30303
+      - --port=30303
+    volumes:
+      - ./data/execution-data:/execution-data
+      - ./genesis_data/el-cl-genesis-data:/el-cl-genesis-data
+    ports:
+      - "8545:8545"
+    restart: unless-stopped
+
+  beacon:
+    networks:
+      - network_eth
+    image: sigp/lighthouse:latest-unstable
+    command:
+      - lighthouse
+      - beacon_node
+      - --debug-level=info
+      - --datadir=/consensus-data
+      - --disable-enr-auto-update
+      - --enr-address=172.20.0.3
+      - --enr-udp-port=9000
+      - --enr-tcp-port=9000
+      - --listen-address=0.0.0.0
+      - --port=9000
+      - --http
+      - --http-address=0.0.0.0
+      - --http-port=4000
+      - --http-allow-sync-stalled
+      - --slots-per-restore-point=32
+      - --disable-packet-filter
+      - --execution-endpoints=http://geth:8551
+      - --jwt-secrets=/el-cl-genesis-data/jwt/jwtsecret
+      - --suggested-fee-recipient=0x8943545177806ED17B9F23F0a21ee5948eCaa776
+      - --subscribe-all-subnets
+      - --metrics
+      - --metrics-address=0.0.0.0
+      - --metrics-allow-origin=*
+      - --metrics-port=5054
+      - --enable-private-discovery
+      - --testnet-dir=/el-cl-genesis-data/network-configs
+    volumes:
+      - ./data/consensus-data:/consensus-data
+      - ./genesis_data/el-cl-genesis-data:/el-cl-genesis-data
+    depends_on:
+      - geth
+    restart: unless-stopped
+
+  validator:
+    networks:
+      network_eth:
+        ipv4_address: 172.20.0.4
+    image: sigp/lighthouse:latest-unstable
+    command:
+      - lighthouse
+      - vc
+      - --debug-level=info
+      - --testnet-dir=/network-configs
+      - --validators-dir=/validator-keys/keys
+      - --secrets-dir=/validator-keys/secrets
+      - --init-slashing-protection
+      - --beacon-nodes=http://beacon:4000
+      - --suggested-fee-recipient=0x8943545177806ED17B9F23F0a21ee5948eCaa776
+      - --metrics
+      - --metrics-address=0.0.0.0
+      - --metrics-allow-origin=*
+      - --metrics-port=8080
+    volumes:
+      - ./genesis_data/el-cl-genesis-data/network-configs:/network-configs
+      - ./genesis_data/validator-keys:/validator-keys
+    depends_on:
+      - beacon
+    restart: unless-stopped

@@ -1,0 +1,373 @@
+# geth + lighthouse + blocksout + blobscan
+version: "3.8"
+networks:
+  network_eth:
+    driver: bridge
+    name: network_eth_l1
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+services:
+  geth:
+    networks:
+      network_eth:
+        ipv4_address: 172.21.0.2
+    image: ethereum/client-go:latest
+    command:
+      - --networkid=3151908
+      - --state.scheme=path
+      - --verbosity=3
+      - --datadir=/execution-data
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.vhosts=*
+      - --http.corsdomain=*
+      - --http.api=admin,engine,net,eth,web3,debug,txpool
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --ws.api=admin,engine,net,eth,web3,debug,txpool
+      - --ws.origins=*
+      - --allow-insecure-unlock
+      - --nat=extip:172.21.0.2
+      - --verbosity=3
+      - --authrpc.port=8551
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.vhosts=*
+      - --authrpc.jwtsecret=/el-cl-genesis-data/jwt/jwtsecret
+      - --syncmode=full
+      - --rpc.allow-unprotected-txs
+      - --metrics
+      - --metrics.addr=0.0.0.0
+      - --metrics.port=9001
+      - --discovery.port=30303
+      - --port=30303
+    volumes:
+      - ./data/execution-data:/execution-data
+      - ./genesis_data/el-cl-genesis-data:/el-cl-genesis-data
+    ports:
+      - "8545:8545"
+    restart: unless-stopped
+
+  beacon:
+    networks:
+      network_eth:
+        ipv4_address: 172.21.0.3
+    image: sigp/lighthouse:latest-unstable
+    command:
+      - lighthouse
+      - beacon_node
+      - --debug-level=info
+      - --datadir=/consensus-data
+      - --disable-enr-auto-update
+      - --enr-address=172.21.0.3
+      - --enr-udp-port=9000
+      - --enr-tcp-port=9000
+      - --listen-address=0.0.0.0
+      - --port=9000
+      - --http
+      - --http-address=0.0.0.0
+      - --http-port=4000
+      - --http-allow-sync-stalled
+      - --slots-per-restore-point=32
+      - --disable-packet-filter
+      - --execution-endpoints=http://geth:8551
+      - --jwt-secrets=/el-cl-genesis-data/jwt/jwtsecret
+      - --suggested-fee-recipient=0x8943545177806ED17B9F23F0a21ee5948eCaa776
+      - --subscribe-all-subnets
+      - --metrics
+      - --metrics-address=0.0.0.0
+      - --metrics-allow-origin=*
+      - --metrics-port=5054
+      - --enable-private-discovery
+      - --testnet-dir=/el-cl-genesis-data/network-configs
+    volumes:
+      - ./data/consensus-data:/consensus-data
+      - ./genesis_data/el-cl-genesis-data:/el-cl-genesis-data
+    depends_on:
+      - geth
+    restart: unless-stopped
+
+  validator:
+    networks:
+      - network_eth
+    image: sigp/lighthouse:latest-unstable
+    command:
+      - lighthouse
+      - vc
+      - --debug-level=info
+      - --testnet-dir=/network-configs
+      - --validators-dir=/validator-keys/keys
+      - --secrets-dir=/validator-keys/secrets
+      - --init-slashing-protection
+      - --beacon-nodes=http://beacon:4000
+      - --suggested-fee-recipient=0x8943545177806ED17B9F23F0a21ee5948eCaa776
+      - --metrics
+      - --metrics-address=0.0.0.0
+      - --metrics-allow-origin=*
+      - --metrics-port=8080
+    volumes:
+      - ./genesis_data/el-cl-genesis-data/network-configs:/network-configs
+      - ./genesis_data/validator-keys:/validator-keys
+    depends_on:
+      - beacon
+    restart: unless-stopped
+
+####################################blocksout######################################
+  blockscout-db-init:
+    image: postgres:15
+    depends_on:
+      - beacon
+    volumes:
+      - ./data/blockscout-data/blockscout-db-data:/var/lib/postgresql/data
+    entrypoint:
+      - sh
+      - -c
+      - |
+        chown -R 2000:2000 /var/lib/postgresql/data
+    networks:
+      - network_eth
+  blockscout-stats-db-init:
+    image: postgres:15
+    depends_on:
+      - beacon
+    volumes:
+      - ./data/blockscout-data/stats-db-data:/var/lib/postgresql/data
+    entrypoint:
+      - sh
+      - -c
+      - |
+        chown -R 2000:2000 /var/lib/postgresql/data
+    networks:
+      - network_eth
+  blockscout-redis-db:
+    networks:
+      - network_eth
+    image: 'redis:alpine'
+    command: redis-server
+    depends_on:
+      blockscout-db-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./data/blockscout-data/redis-data:/data
+  blockscout-db:
+    networks:
+      - network_eth
+    depends_on:
+      blockscout-db-init:
+        condition: service_completed_successfully
+    image: postgres:15
+    user: 2000:2000
+    shm_size: 256m
+    command: postgres -c 'max_connections=200' -c 'client_connection_check_interval=60000'
+    environment:
+      POSTGRES_DB: 'blockscout'
+      POSTGRES_USER: 'blockscout'
+      POSTGRES_PASSWORD: 'ceWb1MeLBEeOIfk65gU8EjF8'
+    volumes:
+      - ./data/blockscout-data/blockscout-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blockscout -d blockscout"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+  blockscout-visualizer:
+    networks:
+      - network_eth
+    image: ghcr.io/blockscout/visualizer:latest
+    depends_on:
+      - blockscout-db
+    env_file:
+      -  ./genesis_data/blockscout/envs/common-visualizer.env
+    platform: linux/amd64
+    restart: unless-stopped
+  blockscout-sig-provider:
+    networks:
+      - network_eth
+    image: ghcr.io/blockscout/sig-provider:latest
+    depends_on:
+    - blockscout-db
+    platform: linux/amd64
+    restart: unless-stopped
+  blockscout-smart-contract-verifier:
+    networks:
+      - network_eth
+    image: ghcr.io/blockscout/smart-contract-verifier:latest
+    depends_on:
+      - blockscout-db
+    env_file:
+      - ./genesis_data/blockscout/envs/common-smart-contract-verifier.env
+    platform: linux/amd64
+    restart: unless-stopped
+  blockscout-backend:
+    networks:
+      - network_eth
+    depends_on:
+      - blockscout-visualizer
+      - blockscout-sig-provider
+      - blockscout-smart-contract-verifier
+    image: blockscout/blockscout:latest
+    stop_grace_period: 5m
+    command: sh -c "bin/blockscout eval \"Elixir.Explorer.ReleaseTasks.create_and_migrate()\" && bin/blockscout start"
+    environment:
+      - ETHEREUM_JSONRPC_VARIANT=geth
+      - ETHEREUM_JSONRPC_HTTP_URL=http://geth:8545/
+      - ETHEREUM_JSONRPC_TRACE_URL=http://geth:8545/
+    env_file:
+      -  ./genesis_data/blockscout/envs/common-blockscout.env
+    volumes:
+      - ./data/blockscout-ata/logs/:/app/logs/
+    restart: unless-stopped
+  blockscout-frontend:
+    networks:
+      - network_eth
+    depends_on:
+      - blockscout-backend
+    image: ghcr.io/blockscout/frontend:latest
+    env_file:
+      -  ./genesis_data/blockscout/envs/common-frontend.env
+    environment:
+      - NEXT_PUBLIC_API_HOST=192.168.17.11
+      - NEXT_PUBLIC_API_PORT=18000
+      - NEXT_PUBLIC_API_PROTOCOL=http
+      - NEXT_PUBLIC_STATS_API_HOST=http://192.168.17.11:18080
+      - NEXT_PUBLIC_APP_HOST=192.168.17.11
+      - NEXT_PUBLIC_APP_PORT=18000
+      - NEXT_PUBLIC_APP_PROTOCOL=http
+      - NEXT_PUBLIC_VISUALIZE_API_HOST=http://192.168.17.11:18081
+      - NEXT_PUBLIC_NETWORK_NAME=3151908
+      - NEXT_PUBLIC_NETWORK_SHORT_NAME=3151908
+      - NEXT_PUBLIC_NETWORK_ID=3151908
+      - NEXT_PUBLIC_NETWORK_CURRENCY_NAME=Ether
+      - NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL=ETH
+      - NEXT_PUBLIC_NETWORK_CURRENCY_DECIMALS=18
+    platform: linux/amd64
+    restart: unless-stopped
+  blockscout-stats-db:
+    networks:
+      - network_eth
+    depends_on:
+      blockscout-stats-db-init:
+        condition: service_completed_successfully
+    image: postgres:15
+    user: 2000:2000
+    shm_size: 256m
+    command: postgres -c 'max_connections=200'
+    environment:
+      POSTGRES_DB: 'stats'
+      POSTGRES_USER: 'stats'
+      POSTGRES_PASSWORD: 'n0uejXPl61ci6ldCuE2gQU5Y'
+    volumes:
+      - ./data/blockscout-data/stats-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stats -d stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+  blockscout-stats:
+    networks:
+      - network_eth
+    depends_on:
+      - blockscout-stats-db
+      - blockscout-backend
+    image: ghcr.io/blockscout/stats:latest
+    env_file:
+      -  ./genesis_data/blockscout/envs/common-stats.env
+    environment:
+      - STATS__DB_URL=${STATS__DB_URL:-postgres://stats:n0uejXPl61ci6ldCuE2gQU5Y@blockscout-stats-db:5432/stats}
+      - STATS__BLOCKSCOUT_DB_URL=${STATS__BLOCKSCOUT_DB_URL:-postgresql://blockscout:ceWb1MeLBEeOIfk65gU8EjF8@blockscout-db:5432/blockscout}
+      - STATS__CREATE_DATABASE=${STATS__CREATE_DATABASE:-true}
+      - STATS__RUN_MIGRATIONS=${STATS__RUN_MIGRATIONS:-true}
+    platform: linux/amd64
+    restart: unless-stopped
+  blockscout-proxy:
+    networks:
+      - network_eth
+    depends_on:
+      - blockscout-backend
+      - blockscout-frontend
+      - blockscout-stats
+    image: nginx:latest
+    volumes:
+      - "./genesis_data/blockscout/proxy:/etc/nginx/templates"
+    ports:
+      # API_HOST(frontend access)
+      - 18000:80
+      # STATS_API_HOST(frontend access)
+      - 18080:8080
+      # VISUALIZE_API_HOST(frontend access)
+      - 18081:8081
+    restart: unless-stopped
+####################################blobscan######################################
+  blobscan-postgres:
+    networks:
+      - network_eth
+    image: postgres:15
+    depends_on:
+      - blockscout-proxy
+    volumes:
+      - ./data/blobscan-data/postgres-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=blobscan
+      - POSTGRES_DB=blobscan_dev
+      - POSTGRES_PASSWORD=s3cr3t
+  blobscan-redis:
+    networks:
+      - network_eth
+    image: "redis:alpine"
+    depends_on:
+      - blockscout-proxy
+    volumes:
+      - ./data/blobscan-data/redis-data:/var/lib/redis
+    environment:
+      - REDIS_REPLICATION_MODE=master
+      #- REDIS_PASSWORD=s3cr3t
+      #- REDIS_USERNAME=blobscan
+  blobscan-api:
+    networks:
+      - network_eth
+    depends_on:
+      - blobscan-postgres
+      - blobscan-redis
+    image: blossomlabs/blobscan:stable
+    command: api
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 5s
+    env_file:
+      - "./genesis_data/blobscan/blobscan.env"
+
+  blobscan-indexer:
+    networks:
+      - network_eth
+    depends_on:
+      blobscan-api:
+        condition: service_healthy
+    image: blossomlabs/blobscan-indexer:master
+    restart: always
+    environment:
+      - BEACON_NODE_ENDPOINT=http://beacon:4000
+      - EXECUTION_NODE_ENDPOINT=http://geth:8545
+    env_file:
+      - "./genesis_data/blobscan/blobscan.env"
+  blobscan-web:
+    networks:
+      - network_eth
+    depends_on:
+      - blobscan-indexer
+    image: blossomlabs/blobscan:stable
+    command: web
+    restart: always
+    ports:
+      - 13000:3000
+    env_file:
+      - "./genesis_data/blobscan/blobscan.env"

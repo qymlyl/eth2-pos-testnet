@@ -1,0 +1,403 @@
+version: "3.9"
+networks:
+  network_eth:
+    driver: bridge
+    name: network_eth_l1
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+services:
+#========================> init chain genesis
+  # Creates a genesis state for the beacon chain using a YAML configuration file and
+  # a deterministic set of 64 validators.
+  create-beacon-chain-genesis:
+    image: "gcr.io/prysmaticlabs/prysm/cmd/prysmctl:HEAD-2f2152"
+    command:
+      - testnet
+      - generate-genesis
+      - --fork=deneb
+      #- --genesis-time=1692064168
+      - --num-validators=64
+      - --genesis-time-delay=15
+      - --output-ssz=/consensus/genesis.ssz
+      - --chain-config-file=/consensus/config.yml
+      - --geth-genesis-json-in=/execution/genesis.json
+      - --geth-genesis-json-out=/execution/genesis.json
+    volumes:
+      - ./components/consensus:/consensus
+      - ./components/execution:/execution
+    networks:
+      - network_eth
+  # Sets up the genesis configuration for the go-ethereum client from a JSON file.
+  geth-genesis:
+    image: "ethereum/client-go:latest"
+    command: --datadir=/execution init /execution/genesis.json
+    volumes:
+      - ./components/execution:/execution
+      - ./components/execution/genesis.json:/execution/genesis.json
+    depends_on:
+      create-beacon-chain-genesis:
+        condition: service_completed_successfully
+    networks:
+      - network_eth
+
+# =========================> init db
+    # backend db-init
+  blockscout-db-init:
+    image: postgres:15
+    volumes:
+      - ./components/blockscout/data/blockscout-db-data:/var/lib/postgresql/data
+    entrypoint:
+      - sh
+      - -c
+      - |
+        chown -R 2000:2000 /var/lib/postgresql/data
+    networks:
+      - network_eth
+  blockscout-stats-db-init:
+    image: postgres:15
+    volumes:
+      - ./components/blockscout/data/stats-db-data:/var/lib/postgresql/data
+    entrypoint:
+      - sh
+      - -c
+      - |
+        chown -R 2000:2000 /var/lib/postgresql/data
+    networks:
+      - network_eth
+  # Runs a Prysm beacon chain from a specified genesis state created in the previous step
+  # and connects to go-ethereum in the same network as the execution client.
+  # The account used in go-ethereum is set as the suggested fee recipient for transactions
+  # proposed via the validators attached to the beacon node.
+  beacon-chain:
+    networks:
+      - network_eth
+    depends_on:
+      create-beacon-chain-genesis:
+        condition: service_completed_successfully
+    image: "gcr.io/prysmaticlabs/prysm/beacon-chain:HEAD-2f2152"
+    command:
+      - --datadir=/consensus/beacondata
+      # No peers to sync with in this testnet, so setting to 0
+      - --min-sync-peers=0
+      - --genesis-state=/consensus/genesis.ssz
+      - --bootstrap-node=
+      - --interop-eth1data-votes
+      # The chain configuration file used for setting up Prysm
+      - --chain-config-file=/consensus/config.yml
+      # We specify the chain id used by our execution client
+      - --contract-deployment-block=0
+      - --chain-id=3151908
+      - --rpc-host=0.0.0.0
+      - --grpc-gateway-host=0.0.0.0
+      - --execution-endpoint=http://geth:8551
+      - --accept-terms-of-use
+      - --jwt-secret=/execution/jwtsecret
+      - --suggested-fee-recipient=0x123463a4b065722e99115d6c222f267d9cabb524
+      - --minimum-peers-per-subnet=0
+      - --enable-debug-rpc-endpoints
+      - --force-clear-db
+    ports:
+      # RPC API
+      - 14000:4000
+      # REST API
+      - 13500:3500
+      #- 8180:8080
+      #- 6160:6060
+      #- 9190:9090
+    volumes:
+      - ./components/consensus:/consensus
+      - ./components/execution:/execution
+      - ./components/execution/jwtsecret:/execution/jwtsecret
+
+  # Runs the go-ethereum execution client with the specified, unlocked account and necessary
+  # APIs to allow for proof-of-stake consensus via Prysm.
+  geth:
+    networks:
+      - network_eth
+    depends_on:
+      geth-genesis:
+        condition: service_completed_successfully
+      beacon-chain:
+        condition: service_started
+    image: "ethereum/client-go:latest"
+    command:
+      - --http
+      - --http.api=eth,net,debug,web3,txpool
+      - --http.addr=0.0.0.0
+      - --http.corsdomain=*
+      - --http.vhosts=*
+      - --ws
+      - --ws.api=eth,net,debug,web3,txpool
+      - --ws.addr=0.0.0.0
+      - --ws.origins=*
+      - --authrpc.vhosts=*
+      - --authrpc.addr=0.0.0.0
+      - --authrpc.jwtsecret=/execution/jwtsecret
+      - --datadir=/execution
+      - --allow-insecure-unlock
+      - --unlock=0x123463a4b065722e99115d6c222f267d9cabb524
+      - --password=/execution/geth_password.txt
+      - --nodiscover
+      - --syncmode=full
+    ports:
+      #- 8551:8551
+      - 8545:8545
+      #- 8546:8546
+    volumes:
+      - ./components/execution:/execution
+      - ./components/execution/jwtsecret:/execution/jwtsecret
+      - ./components/execution/geth_password.txt:/execution/geth_password.txt
+
+  # We run a validator client with 64, deterministically-generated keys that match
+  # The validator keys present in the beacon chain genesis state generated a few steps above.
+  validator:
+    networks:
+      - network_eth
+    image: "gcr.io/prysmaticlabs/prysm/validator:HEAD-2f2152"
+    command:
+      - --beacon-rpc-provider=beacon-chain:4000
+      - --datadir=/consensus/validatordata
+      - --accept-terms-of-use
+      - --interop-num-validators=64
+      - --interop-start-index=0
+      - --chain-config-file=/consensus/config.yml
+      - --force-clear-db
+    depends_on:
+      beacon-chain:
+        condition: service_started
+    volumes:
+      - ./components/consensus:/consensus
+
+#=========================================== blockscout
+  blockscout-redis-db:
+    networks:
+      - network_eth
+    image: 'redis:alpine'
+    command: redis-server
+    volumes:
+      - ./components/blockscout/data/redis-data:/data
+
+  blockscout-db:
+    networks:
+      - network_eth
+    depends_on:
+      blockscout-db-init:
+        condition: service_completed_successfully
+    image: postgres:15
+    user: 2000:2000
+    shm_size: 256m
+    command: postgres -c 'max_connections=200' -c 'client_connection_check_interval=60000'
+    environment:
+        POSTGRES_DB: 'blockscout'
+        POSTGRES_USER: 'blockscout'
+        POSTGRES_PASSWORD: 'ceWb1MeLBEeOIfk65gU8EjF8'
+    volumes:
+      - ./components/blockscout/data/blockscout-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blockscout -d blockscout"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  blockscout-backend:
+    networks:
+      - network_eth
+    depends_on:
+      - blockscout-db
+      - blockscout-redis-db
+      - geth
+    image: blockscout/blockscout:latest
+    stop_grace_period: 5m
+    command: sh -c "bin/blockscout eval \"Elixir.Explorer.ReleaseTasks.create_and_migrate()\" && bin/blockscout start"
+    env_file:
+      -  ./components/blockscout/envs/common-blockscout.env
+    volumes:
+      - ./components/blockscout/data/logs/:/app/logs/
+
+  blockscout-visualizer:
+    networks:
+      - network_eth
+    image: ghcr.io/blockscout/visualizer:latest
+   #pull_policy: always
+    platform: linux/amd64
+    env_file:
+      -  ./components/blockscout/envs/common-visualizer.env
+
+  blockscout-sig-provider:
+    networks:
+      - network_eth
+    image: ghcr.io/blockscout/sig-provider:latest
+   #pull_policy: always
+    platform: linux/amd64
+
+  blockscout-smart-contract-verifier:
+    networks:
+      - network_eth
+    image: ghcr.io/blockscout/smart-contract-verifier:latest
+   #pull_policy: always
+    platform: linux/amd64
+    env_file:
+      -  ./components/blockscout/envs/common-smart-contract-verifier.env
+
+  blockscout-frontend:
+    networks:
+      - network_eth
+    depends_on:
+      - blockscout-backend
+    image: ghcr.io/blockscout/frontend:latest
+   #pull_policy: always
+    platform: linux/amd64
+    env_file:
+      -  ./components/blockscout/envs/common-frontend.env
+    environment:
+      - NEXT_PUBLIC_API_HOST=192.168.17.11
+      - NEXT_PUBLIC_API_PORT=18000
+      - NEXT_PUBLIC_API_PROTOCOL=http
+      - NEXT_PUBLIC_STATS_API_HOST=http://192.168.17.11:18080
+      - NEXT_PUBLIC_APP_HOST=192.168.17.11
+      - NEXT_PUBLIC_APP_PORT=18000
+      - NEXT_PUBLIC_APP_PROTOCOL=http
+      - NEXT_PUBLIC_VISUALIZE_API_HOST=http://192.168.17.11:18081
+      - NEXT_PUBLIC_NETWORK_NAME=3151908
+      - NEXT_PUBLIC_NETWORK_SHORT_NAME=3151908
+      - NEXT_PUBLIC_NETWORK_ID=3151908
+      - NEXT_PUBLIC_NETWORK_CURRENCY_NAME=Ether
+      - NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL=ETH
+      - NEXT_PUBLIC_NETWORK_CURRENCY_DECIMALS=18
+
+  blockscout-stats-db:
+    networks:
+      - network_eth
+    depends_on:
+      blockscout-stats-db-init:
+        condition: service_completed_successfully
+    image: postgres:15
+    user: 2000:2000
+    shm_size: 256m
+    command: postgres -c 'max_connections=200'
+    environment:
+        POSTGRES_DB: 'stats'
+        POSTGRES_USER: 'stats'
+        POSTGRES_PASSWORD: 'n0uejXPl61ci6ldCuE2gQU5Y'
+    volumes:
+      - ./components/blockscout/data/stats-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stats -d stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  blockscout-stats:
+    networks:
+      - network_eth
+    depends_on:
+      - blockscout-stats-db
+      - blockscout-backend
+    image: ghcr.io/blockscout/stats:latest
+    #pull_policy: always
+    platform: linux/amd64
+    env_file:
+      -  ./components/blockscout/envs/common-stats.env
+    environment:
+      - STATS__DB_URL=${STATS__DB_URL:-postgres://stats:n0uejXPl61ci6ldCuE2gQU5Y@blockscout-stats-db:5432/stats}
+      - STATS__BLOCKSCOUT_DB_URL=${STATS__BLOCKSCOUT_DB_URL:-postgresql://blockscout:ceWb1MeLBEeOIfk65gU8EjF8@blockscout-db:5432/blockscout}
+      - STATS__CREATE_DATABASE=${STATS__CREATE_DATABASE:-true}
+      - STATS__RUN_MIGRATIONS=${STATS__RUN_MIGRATIONS:-true}
+
+  # user-ops-indexer:
+  #   depends_on:
+  #     - db
+  #     - backend
+  #   extends:
+  #     file: ./blockscout/services/user-ops-indexer.yml
+  #     service: user-ops-indexer
+
+  blockscout-proxy:
+    networks:
+      - network_eth
+    depends_on:
+      - blockscout-backend
+      - blockscout-frontend
+      - blockscout-stats
+    image: nginx
+    volumes:
+      - "./components/blockscout/proxy:/etc/nginx/templates"
+    ports:
+      # API_HOST(frontend access)
+      - 18000:80
+      # STATS_API_HOST(frontend access)
+      - 18080:8080
+      # VISUALIZE_API_HOST(frontend access)
+      - 18081:8081
+# ===================================blobscan
+  blobscan-postgres:
+    networks:
+      - network_eth
+    image: postgres:15
+    # ports:
+    #   - 15432:5432
+    volumes:
+      - ./components/blobscan/data/postgres-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=blobscan
+      - POSTGRES_DB=blobscan_dev
+      - POSTGRES_PASSWORD=s3cr3t
+  blobscan-redis:
+    networks:
+      - network_eth
+    image: "redis:alpine"
+    # ports:
+    #   - "16379:6379"
+    volumes:
+      - ./components/blobscan/data/redis-data:/var/lib/redis
+    environment:
+      - REDIS_REPLICATION_MODE=master
+      #- REDIS_PASSWORD=s3cr3t
+      #- REDIS_USERNAME=blobscan
+  blobscan-api:
+    networks:
+      - network_eth
+    depends_on:
+      - blobscan-postgres
+      - blobscan-redis
+    image: blossomlabs/blobscan:stable
+    command: api
+    # ports:
+    #   - 13001:3001
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 5s
+    env_file:
+      - "./components/blobscan/envs/blobscan.env"
+
+  blobscan-indexer:
+    networks:
+      - network_eth
+    depends_on:
+      blobscan-api:
+        condition: service_healthy
+    image: blossomlabs/blobscan-indexer:master
+    environment:
+      - BEACON_NODE_ENDPOINT=http://beacon-chain:3500
+      - EXECUTION_NODE_ENDPOINT=http://geth:8545
+    env_file:
+      - "./components/blobscan/envs/blobscan.env"
+      
+  blobscan-web:
+    networks:
+      - network_eth
+    depends_on:
+      - blobscan-indexer
+    image: blossomlabs/blobscan:stable
+    command: web
+    ports:
+      - 13000:3000
+    env_file:
+      - "./components/blobscan/envs/blobscan.env"
