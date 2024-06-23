@@ -336,7 +336,6 @@ services:
       - blobscan-redis
     image: blossomlabs/blobscan:stable
     command: api
-    restart: always
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3001/healthcheck"]
       interval: 30s
@@ -345,6 +344,7 @@ services:
       start_period: 5s
     env_file:
       - "./genesis_data/blobscan/blobscan.env"
+    restart: unless-stopped
 
   blobscan-indexer:
     networks:
@@ -353,12 +353,12 @@ services:
       blobscan-api:
         condition: service_healthy
     image: blossomlabs/blobscan-indexer:master
-    restart: always
     environment:
       - BEACON_NODE_ENDPOINT=http://beacon:4000
       - EXECUTION_NODE_ENDPOINT=http://geth:8545
     env_file:
       - "./genesis_data/blobscan/blobscan.env"
+    restart: unless-stopped
   blobscan-web:
     networks:
       - network_eth
@@ -366,8 +366,8 @@ services:
       - blobscan-indexer
     image: blossomlabs/blobscan:stable
     command: web
-    restart: always
     ports:
       - 13000:3000
     env_file:
       - "./genesis_data/blobscan/blobscan.env"
+    restart: unless-stopped

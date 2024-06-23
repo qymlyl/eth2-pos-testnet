@@ -82,7 +82,7 @@ generate_genesis_data:
 # 初始化geth的创世信息
 init_geth_genesis:
 	@echo "Init geth gensis"
-	@docker run --rm -it -u $UID \
+	@docker run --rm -it \
 	-v $(PWD_DIR)/data/execution-data:/execution-data \
 	-v $(PWD_DIR)/genesis_data/el-cl-genesis-data:/el-cl-genesis-data \
 	ethereum/client-go:latest \
