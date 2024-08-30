@@ -54,13 +54,56 @@ blob浏览器: blobscan <br/>
 ```shell
 cd geth-lighthouse
 ```
-#### 注意事项
+### 注意事项
+#### 机器架构问题
 blocksout目前只有linux/amd64平台的镜像 <br/>
 
 `docker-compose-explorer.yaml`中的`service.blockscout-frontend`下的`environment`环境变量中，`NEXT_PUBLIC_API_HOST`、`NEXT_PUBLIC_STATS_API_HOST`、`NEXT_PUBLIC_APP_HOST`、`NEXT_PUBLIC_VISUALIZE_API_HOST`需要配置为**宿主机的IP**<br/>
 
 `service.blockscout-frontend`下的`environment`环境变量中`NEXT_PUBLIC_API_PORT`、`NEXT_PUBLIC_STATS_API_HOST`和`NEXT_PUBLIC_VISUALIZE_API_HOST`中的端口配置需要和`blockscout-proxy`中ports配置一样，这三个端口是必须暴露的，这三个端口是blocksout的前端页面发送的请求，所以blocksout-frontend需要配置所在宿主机的ip
 
+#### gcmode=archive
+默认启动的链节点并未配置`--gcmode=archive`, 即并不会保存交易的历史状态，当交易发送之后一段时间后
+将无法获取交易对应的`trace`信息。
+
+需要修改`docker-compose.yml`在`geth`的`command`下添加参数`--gcmode=archive`, 如下：
+```yaml
+services:
+  geth:
+    ...
+    command:
+      ...
+      - --state.scheme=path
+      - --syncmode=full
+      - --gcmode=archive
+```
+如上配置会报错：`Fatal: Failed to register the Ethereum service: incompatible state scheme, stored: path, provided: hash`
+
+因`--state.scheme=path`是比较新的一种存储模式，暂时无法与`--gcmode=archive`同时使用，需将`--state.scheme=path`修改为`--state.scheme=hash`, 可参考文档：https://blog.ethereum.org/2023/09/12/geth-v1-13-0
+
+需修改配置`Makefile`中`init_geth_genesis`, 添加参数`--state.scheme=hash`， 如下：
+```shell
+    init_geth_genesis:
+	@echo "Init geth gensis"
+	@docker run --rm -it \
+	-v $(PWD_DIR)/data/execution-data:/execution-data \
+	-v $(PWD_DIR)/genesis_data/el-cl-genesis-data:/el-cl-genesis-data \
+	ethereum/client-go:latest \
+	--state.scheme=hash \
+	--datadir=/execution-data \
+	init /el-cl-genesis-data/network-configs/genesis.json
+```
+修改`docker-compose.yml`， 如下：
+```yaml
+services:
+  geth:
+    ...
+    command:
+      ...
+      - --state.scheme=hash
+      - --syncmode=full
+      - --gcmode=archive
+```
 #### 生成创世信息
 ```shell
 make generate_genesis_data
